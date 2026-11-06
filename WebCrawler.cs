@@ -363,6 +363,11 @@ public class WebCrawler
             // Get HTML content (after JS rendering)
             var htmlContent = await page.ContentAsync();
 
+            // Relative references in the HTML resolve against the browser's base URI (final URL
+            // after redirects, including the trailing slash of directory URLs, or a <base> tag),
+            // not against the requested URL.
+            var baseUrl = await page.EvaluateAsync<string>("document.baseURI");
+
             // Extract links and add to queue
             var links = await ExtractLinksAsync(page, url);
             foreach (var link in links)
@@ -376,14 +381,14 @@ public class WebCrawler
             }
 
             // Download images and rewrite paths in HTML
-            htmlContent = await DownloadImagesAndRewriteHtml(page, htmlContent, url);
+            htmlContent = await DownloadImagesAndRewriteHtml(page, htmlContent, url, baseUrl);
 
             // Download stylesheets (and the fonts/images they reference), rewrite references
             if (_downloadAssets && _cleanMode != CleanMode.Minimal)
-                htmlContent = await DownloadStylesheetsAndRewriteHtmlAsync(page, htmlContent, url);
+                htmlContent = await DownloadStylesheetsAndRewriteHtmlAsync(page, htmlContent, url, baseUrl);
 
             // Rewrite links to local file paths
-            htmlContent = RewriteLinksToLocal(htmlContent, url);
+            htmlContent = RewriteLinksToLocal(htmlContent, url, baseUrl);
 
             // Clean HTML
             htmlContent = HtmlCleaner.Clean(htmlContent, _cleanMode);
@@ -571,28 +576,31 @@ public class WebCrawler
                || path.StartsWith(_basePath + "/", StringComparison.OrdinalIgnoreCase);
     }
 
-    private async Task<string> DownloadImagesAndRewriteHtml(IPage page, string html, string pageUrl)
+    private async Task<string> DownloadImagesAndRewriteHtml(IPage page, string html, string pageUrl, string baseUrl)
     {
-        var imgSrcs = await page.EvalOnSelectorAllAsync<string[]>(
+        // The HTML contains the raw attribute value (e.g. "/images/a.png"), the DOM property is absolute
+        var imgSrcs = await page.EvalOnSelectorAllAsync<string[][]>(
             "img[src]",
-            "elements => elements.map(e => e.src)");
+            "elements => elements.map(e => [e.getAttribute('src'), e.src])");
 
-        foreach (var src in imgSrcs)
+        foreach (var img in imgSrcs)
         {
+            var rawSrc = img[0];
             try
             {
-                var absoluteSrc = ResolveUrl(src, pageUrl);
+                var absoluteSrc = ResolveUrl(img[1], baseUrl);
                 if (absoluteSrc == null) continue;
 
                 var localPath = await DownloadImageAsync(absoluteSrc, pageUrl);
                 if (localPath != null)
                 {
-                    html = html.Replace(src, localPath);
+                    html = html.Replace($"src=\"{rawSrc}\"", $"src=\"{localPath}\"")
+                               .Replace($"src=\"{System.Net.WebUtility.HtmlEncode(rawSrc)}\"", $"src=\"{localPath}\"");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[WARN] Failed to load image: {src} - {ex.Message}");
+                Console.WriteLine($"[WARN] Failed to load image: {rawSrc} - {ex.Message}");
             }
         }
 
@@ -605,7 +613,7 @@ public class WebCrawler
         {
             try
             {
-                var absoluteSrc = ResolveUrl(src, pageUrl);
+                var absoluteSrc = ResolveUrl(src, baseUrl);
                 if (absoluteSrc == null) continue;
 
                 var localPath = await DownloadImageAsync(absoluteSrc, pageUrl);
@@ -636,7 +644,7 @@ public class WebCrawler
         {
             try
             {
-                var absoluteSrc = ResolveUrl(src, pageUrl);
+                var absoluteSrc = ResolveUrl(src, baseUrl);
                 if (absoluteSrc == null) continue;
 
                 var localPath = await DownloadImageAsync(absoluteSrc, pageUrl);
@@ -699,7 +707,7 @@ public class WebCrawler
     /// Downloads linked stylesheets into _assets/, rewrites their url()/@import references
     /// and the link tags / inline style blocks in the page.
     /// </summary>
-    private async Task<string> DownloadStylesheetsAndRewriteHtmlAsync(IPage page, string html, string pageUrl)
+    private async Task<string> DownloadStylesheetsAndRewriteHtmlAsync(IPage page, string html, string pageUrl, string baseUrl)
     {
         var links = await page.EvalOnSelectorAllAsync<string[][]>(
             "link[rel~='stylesheet'][href]",
@@ -721,7 +729,7 @@ public class WebCrawler
         var replacements = new List<(string Old, string New)>();
         foreach (Match m in matches)
         {
-            var css = await RewriteCssAsync(m.Groups[2].Value, pageUrl, depth: 0,
+            var css = await RewriteCssAsync(m.Groups[2].Value, baseUrl, depth: 0,
                 toLocal: path => GetRelativePathFromPage(pageUrl, path));
             if (css != m.Groups[2].Value)
                 replacements.Add((m.Value, m.Groups[1].Value + css + m.Groups[3].Value));
@@ -1005,14 +1013,14 @@ public class WebCrawler
     /// <summary>
     /// Rewrites links in HTML to local file paths.
     /// </summary>
-    private string RewriteLinksToLocal(string html, string currentPageUrl)
+    private string RewriteLinksToLocal(string html, string currentPageUrl, string baseUrl)
     {
         html = Regex.Replace(html, @"(<a\b[^>]*?\shref="")([^""]+)""", match =>
         {
             var href = match.Groups[2].Value;
             try
             {
-                var resolved = ResolveUrl(href, currentPageUrl);
+                var resolved = ResolveUrl(href, baseUrl);
                 if (resolved != null && IsInScope(resolved) && (_downloadFiles || !IsFileUrl(resolved)))
                 {
                     var targetRelPath = GetRelativeFilePath(resolved, isImage: false);
