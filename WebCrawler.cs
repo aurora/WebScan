@@ -296,7 +296,7 @@ public class WebCrawler
 
             // Redirect detection: check if final URL is still in scope
             var finalUrl = page.Url;
-            if (!finalUrl.Equals(url, StringComparison.OrdinalIgnoreCase))
+            if (NormalizeUrl(finalUrl) != NormalizeUrl(url))
             {
                 Console.WriteLine($"[REDIRECT] {url} → {finalUrl}");
 
