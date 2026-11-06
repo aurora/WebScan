@@ -78,6 +78,20 @@ var excludeOption = new Option<string[]>(
     AllowMultipleArgumentsPerToken = true
 };
 
+var skipDownloadsOption = new Option<bool>(
+    name: "--skip-downloads",
+    description: "Do not download linked files (exe, zip, pdf, ...); links to them stay unchanged")
+{
+    IsRequired = false
+};
+
+var skipAssetsOption = new Option<bool>(
+    name: "--skip-assets",
+    description: "Do not download stylesheets and the fonts/images they reference")
+{
+    IsRequired = false
+};
+
 var rootCommand = new RootCommand("WebScan - Website crawler with JavaScript rendering (Playwright)")
 {
     urlOption,
@@ -88,7 +102,9 @@ var rootCommand = new RootCommand("WebScan - Website crawler with JavaScript ren
     cleanOption,
     maxWaitOption,
     includeOption,
-    excludeOption
+    excludeOption,
+    skipDownloadsOption,
+    skipAssetsOption
 };
 
 rootCommand.SetHandler(async context =>
@@ -102,6 +118,8 @@ rootCommand.SetHandler(async context =>
     var maxWait = context.ParseResult.GetValueForOption(maxWaitOption);
     var includes = context.ParseResult.GetValueForOption(includeOption);
     var excludes = context.ParseResult.GetValueForOption(excludeOption);
+    var skipDownloads = context.ParseResult.GetValueForOption(skipDownloadsOption);
+    var skipAssets = context.ParseResult.GetValueForOption(skipAssetsOption);
 
     Console.WriteLine("╔══════════════════════════════════════╗");
     Console.WriteLine("║          WebScan Crawler             ║");
@@ -140,7 +158,7 @@ rootCommand.SetHandler(async context =>
     Directory.CreateDirectory(output);
 
     // Start crawler
-    var crawler = new WebCrawler(url, output, cookies, limit, mode, clean, maxWait, includes, excludes);
+    var crawler = new WebCrawler(url, output, cookies, limit, mode, clean, maxWait, includes, excludes, !skipDownloads, !skipAssets);
     await crawler.CrawlAsync();
 });
 

@@ -71,6 +71,8 @@ dotnet run -- --url https://example.com/help --cookies cookies.txt --mode gentle
 | `--max-wait` | `-w` | ❌ | Max delay between pages in ms (default: 3000, gentle mode only) |
 | `--include` | | ❌ | Additional paths to include (relative to start URL, repeatable) |
 | `--exclude` | | ❌ | Paths to exclude from crawling (relative to start URL, repeatable) |
+| `--skip-downloads` | | ❌ | Do not download linked files (exe, zip, pdf, ...). By default they are saved and links rewritten |
+| `--skip-assets` | | ❌ | Do not download stylesheets and the fonts/images they reference (stored in `_assets/` by default; not used with `--clean minimal`) |
 
 ### Crawl Modes
 

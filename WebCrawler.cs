@@ -28,7 +28,23 @@ public class WebCrawler
     private readonly Random _random = new();
     private readonly List<string> _includePaths = new();
     private readonly List<string> _excludePaths = new();
+    private readonly bool _downloadFiles;
+    private readonly bool _downloadAssets;
+    private IBrowserContext? _context;
+    private readonly Dictionary<string, string?> _assetCache = new(StringComparer.OrdinalIgnoreCase);
     private int _pagesDownloaded;
+    private int _filesDownloaded;
+
+    // Link targets with these extensions are saved as-is instead of being rendered as pages
+    private static readonly HashSet<string> FileExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".exe", ".com", ".dll", ".msi", ".bin", ".iso", ".img", ".dmg", ".deb", ".rpm", ".apk", ".jar", ".hex",
+        ".zip", ".7z", ".rar", ".gz", ".tgz", ".tar", ".bz2", ".xz", ".lzh", ".arj",
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp", ".rtf",
+        ".css", ".js", ".txt", ".csv", ".json", ".xml", ".asm", ".c", ".h", ".pas", ".bas",
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".ico", ".tif", ".tiff",
+        ".mp3", ".wav", ".ogg", ".flac", ".mp4", ".avi", ".mov", ".mkv", ".webm", ".ttf", ".woff", ".woff2"
+    };
 
     // Realistic user agents (current desktop browsers)
     private static readonly string[] UserAgents =
@@ -43,8 +59,11 @@ public class WebCrawler
 
     public WebCrawler(string startUrl, string outputDir, IReadOnlyList<Cookie>? cookies, int? limit,
         CrawlMode mode, CleanMode cleanMode, int maxWait,
-        IReadOnlyList<string>? includePaths = null, IReadOnlyList<string>? excludePaths = null)
+        IReadOnlyList<string>? includePaths = null, IReadOnlyList<string>? excludePaths = null,
+        bool downloadFiles = true, bool downloadAssets = true)
     {
+        _downloadAssets = downloadAssets;
+        _downloadFiles = downloadFiles;
         _startUrl = startUrl.TrimEnd('/');
         _outputDir = outputDir;
         _cookies = cookies;
@@ -176,6 +195,8 @@ public class WebCrawler
             JavaScriptEnabled = true
         });
 
+        _context = context;
+
         // Stealth: hide navigator.webdriver
         await context.AddInitScriptAsync(@"
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -239,7 +260,9 @@ public class WebCrawler
                 await Task.Delay(delay);
             }
 
-            var shouldContinue = await ProcessPageAsync(context, url);
+            var shouldContinue = IsFileUrl(url)
+                ? await DownloadFileAsync(context, url)
+                : await ProcessPageAsync(context, url);
             if (!shouldContinue)
             {
                 Console.WriteLine("\n[ABORT] Crawling aborted.");
@@ -247,7 +270,7 @@ public class WebCrawler
             }
         }
 
-        Console.WriteLine($"\n[DONE] Crawling complete. {_pagesDownloaded} pages downloaded.");
+        Console.WriteLine($"\n[DONE] Crawling complete. {_pagesDownloaded} pages and {_filesDownloaded} files downloaded.");
     }
 
     /// <summary>
@@ -279,6 +302,8 @@ public class WebCrawler
         Console.WriteLine($"\n[CRAWL] {url}");
 
         var page = await context.NewPageAsync();
+        var downloadTask = new TaskCompletionSource<IDownload>(TaskCreationOptions.RunContinuationsAsynchronously);
+        page.Download += (_, download) => downloadTask.TrySetResult(download);
 
         try
         {
@@ -353,6 +378,10 @@ public class WebCrawler
             // Download images and rewrite paths in HTML
             htmlContent = await DownloadImagesAndRewriteHtml(page, htmlContent, url);
 
+            // Download stylesheets (and the fonts/images they reference), rewrite references
+            if (_downloadAssets && _cleanMode != CleanMode.Minimal)
+                htmlContent = await DownloadStylesheetsAndRewriteHtmlAsync(page, htmlContent, url);
+
             // Rewrite links to local file paths
             htmlContent = RewriteLinksToLocal(htmlContent, url);
 
@@ -365,6 +394,33 @@ public class WebCrawler
 
             Console.WriteLine($"[OK] Page saved ({_pagesDownloaded}/{(_limit.HasValue ? _limit.Value.ToString() : "∞")})");
         }
+        catch (PlaywrightException ex) when (ex.Message.Contains("Download is starting"))
+        {
+            // The URL has no recognizable file extension but the server answers with a download
+            if (!_downloadFiles)
+            {
+                Console.WriteLine("[SKIP] URL is a file download (--skip-downloads).");
+            }
+            else
+            {
+                try
+                {
+                    var download = await downloadTask.Task.WaitAsync(TimeSpan.FromSeconds(30));
+                    var name = Regex.Replace(download.SuggestedFilename, @"[^\w\-.]", "_");
+                    var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(url)))[..8].ToLowerInvariant();
+                    var relativePath = Path.Combine("_downloads", $"{hash}_{name}");
+                    var fullPath = Path.Combine(_outputDir, relativePath);
+                    Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+                    await download.SaveAsAsync(fullPath);
+                    _filesDownloaded++;
+                    Console.WriteLine($"[FILE] {relativePath}");
+                }
+                catch (Exception inner)
+                {
+                    Console.WriteLine($"[ERROR] Download failed at {url}: {inner.Message}");
+                }
+            }
+        }
         catch (Exception ex)
         {
             Console.WriteLine($"[ERROR] Error at {url}: {ex.Message}");
@@ -375,6 +431,44 @@ public class WebCrawler
         }
 
         return true; // Continue crawling
+    }
+
+    private static bool IsFileUrl(string url)
+    {
+        return Uri.TryCreate(url, UriKind.Absolute, out var uri)
+               && FileExtensions.Contains(Path.GetExtension(uri.AbsolutePath));
+    }
+
+    /// <summary>
+    /// Downloads a non-HTML file (binary, archive, document...) using the browser context's cookies.
+    /// </summary>
+    private async Task<bool> DownloadFileAsync(IBrowserContext context, string url)
+    {
+        Console.WriteLine($"\n[FILE] {url}");
+
+        try
+        {
+            var response = await context.APIRequest.GetAsync(url, new APIRequestContextOptions { Timeout = 120000 });
+            if (!response.Ok)
+            {
+                Console.WriteLine($"[WARN] Failed to download file: {url} (Status: {response.Status})");
+                return true;
+            }
+
+            var relativePath = GetRelativeFilePath(url, isImage: false);
+            var fullPath = Path.Combine(_outputDir, relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            await File.WriteAllBytesAsync(fullPath, await response.BodyAsync());
+
+            _filesDownloaded++;
+            Console.WriteLine($"[SAVE] {relativePath}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ERROR] Error at {url}: {ex.Message}");
+        }
+
+        return true;
     }
 
     private async Task<List<string>> ExtractLinksAsync(IPage page, string currentUrl)
@@ -390,7 +484,8 @@ public class WebCrawler
             try
             {
                 var absoluteUrl = ResolveUrl(href, currentUrl);
-                if (absoluteUrl != null && IsInScope(absoluteUrl))
+                if (absoluteUrl != null && IsInScope(absoluteUrl)
+                    && (_downloadFiles || !IsFileUrl(absoluteUrl)))
                 {
                     links.Add(absoluteUrl);
                 }
@@ -596,6 +691,159 @@ public class WebCrawler
         return TrackingDomains.Any(d => uri.Host.Equals(d, StringComparison.OrdinalIgnoreCase));
     }
 
+    private static readonly Regex CssUrlRegex = new(@"url\(\s*(['""]?)(.*?)\1\s*\)", RegexOptions.IgnoreCase);
+    private static readonly Regex CssImportRegex = new(@"@import\s+(['""])(.*?)\1", RegexOptions.IgnoreCase);
+    private static readonly Regex StyleBlockRegex = new(@"(<style\b[^>]*>)([\s\S]*?)(</style>)", RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// Downloads linked stylesheets into _assets/, rewrites their url()/@import references
+    /// and the link tags / inline style blocks in the page.
+    /// </summary>
+    private async Task<string> DownloadStylesheetsAndRewriteHtmlAsync(IPage page, string html, string pageUrl)
+    {
+        var links = await page.EvalOnSelectorAllAsync<string[][]>(
+            "link[rel~='stylesheet'][href]",
+            "elements => elements.map(e => [e.getAttribute('href'), e.href])");
+
+        foreach (var link in links)
+        {
+            var raw = link[0];
+            var assetPath = await DownloadAssetAsync(link[1], pageUrl, isCss: true, depth: 0);
+            if (assetPath == null) continue;
+
+            var local = GetRelativePathFromPage(pageUrl, assetPath);
+            html = html.Replace($"\"{raw}\"", $"\"{local}\"")
+                       .Replace($"\"{System.Net.WebUtility.HtmlEncode(raw)}\"", $"\"{local}\"");
+        }
+
+        // Inline <style> blocks may reference images and fonts as well
+        var matches = StyleBlockRegex.Matches(html);
+        var replacements = new List<(string Old, string New)>();
+        foreach (Match m in matches)
+        {
+            var css = await RewriteCssAsync(m.Groups[2].Value, pageUrl, depth: 0,
+                toLocal: path => GetRelativePathFromPage(pageUrl, path));
+            if (css != m.Groups[2].Value)
+                replacements.Add((m.Value, m.Groups[1].Value + css + m.Groups[3].Value));
+        }
+        foreach (var (oldBlock, newBlock) in replacements)
+            html = html.Replace(oldBlock, newBlock);
+
+        return html;
+    }
+
+    /// <summary>
+    /// Rewrites url(...) and @import references in CSS text to locally downloaded assets.
+    /// </summary>
+    private async Task<string> RewriteCssAsync(string css, string cssUrl, int depth, Func<string, string> toLocal)
+    {
+        var refs = new Dictionary<string, string?>();
+
+        foreach (Match m in CssUrlRegex.Matches(css))
+            refs.TryAdd(m.Groups[2].Value, null);
+        foreach (Match m in CssImportRegex.Matches(css))
+            refs.TryAdd(m.Groups[2].Value, null);
+
+        foreach (var reference in refs.Keys.ToList())
+        {
+            if (reference.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) continue;
+
+            var absolute = ResolveUrl(reference, cssUrl);
+            if (absolute == null) continue;
+
+            var isCss = Path.GetExtension(new Uri(absolute).AbsolutePath)
+                .Equals(".css", StringComparison.OrdinalIgnoreCase);
+            var assetPath = await DownloadAssetAsync(absolute, cssUrl, isCss, depth + 1);
+            if (assetPath != null)
+                refs[reference] = toLocal(assetPath);
+        }
+
+        css = CssUrlRegex.Replace(css, m =>
+            refs.GetValueOrDefault(m.Groups[2].Value) is { } local
+                ? $"url({m.Groups[1].Value}{local}{m.Groups[1].Value})"
+                : m.Value);
+        css = CssImportRegex.Replace(css, m =>
+            refs.GetValueOrDefault(m.Groups[2].Value) is { } local
+                ? $"@import {m.Groups[1].Value}{local}{m.Groups[1].Value}"
+                : m.Value);
+
+        return css;
+    }
+
+    /// <summary>
+    /// Downloads a stylesheet, font or CSS image to _assets/. Returns the path relative to the
+    /// output directory, or null if it was skipped or failed. All assets live in one flat folder,
+    /// so references between assets are plain file names.
+    /// </summary>
+    private async Task<string?> DownloadAssetAsync(string url, string referer, bool isCss, int depth)
+    {
+        if (_context == null || depth > 5) return null;
+        if (!url.StartsWith("http", StringComparison.OrdinalIgnoreCase)) return null;
+        if (_assetCache.TryGetValue(url, out var cached)) return cached;
+
+        // Cleanup removes these links anyway, don't leave dangling local copies
+        if (IsTrackingUrl(url) || (_cleanMode == CleanMode.Clean && IsStrippedExternal(url)))
+        {
+            _assetCache[url] = null;
+            return null;
+        }
+
+        var uri = new Uri(url);
+        var ext = Path.GetExtension(uri.AbsolutePath);
+        if (string.IsNullOrEmpty(ext) || ext.Length > 6)
+            ext = isCss ? ".css" : ".bin";
+        var name = Regex.Replace(Path.GetFileNameWithoutExtension(uri.AbsolutePath), @"[^\w\-.]", "_");
+        if (name.Length > 40) name = name[..40];
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(url)))[..8].ToLowerInvariant();
+        var relativePath = $"_assets/{name}_{hash}{ext}";
+        _assetCache[url] = relativePath; // set early: guards against @import cycles
+
+        try
+        {
+            var response = await _context.APIRequest.GetAsync(url, new APIRequestContextOptions
+            {
+                Headers = new Dictionary<string, string> { ["Referer"] = referer },
+                Timeout = 60000
+            });
+            if (!response.Ok)
+            {
+                Console.WriteLine($"[WARN] Failed to load asset: {url} (Status: {response.Status})");
+                _assetCache[url] = null;
+                return null;
+            }
+
+            var fullPath = Path.Combine(_outputDir, relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+
+            if (isCss)
+            {
+                var css = await RewriteCssAsync(await response.TextAsync(), url, depth, path => Path.GetFileName(path));
+                await File.WriteAllTextAsync(fullPath, css);
+            }
+            else
+            {
+                await File.WriteAllBytesAsync(fullPath, await response.BodyAsync());
+            }
+
+            Console.WriteLine($"[ASSET] {relativePath}");
+            return relativePath;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARN] Asset download failed: {url} - {ex.Message}");
+            _assetCache[url] = null;
+            return null;
+        }
+    }
+
+    private static bool IsStrippedExternal(string url)
+    {
+        return Uri.TryCreate(url, UriKind.Absolute, out var uri)
+               && (uri.Host.Equals("fonts.googleapis.com", StringComparison.OrdinalIgnoreCase)
+                   || uri.Host.Equals("fonts.gstatic.com", StringComparison.OrdinalIgnoreCase)
+                   || uri.Host.Equals("use.fontawesome.com", StringComparison.OrdinalIgnoreCase));
+    }
+
     private async Task<string?> DownloadImageAsync(string imageUrl, string pageUrl)
     {
         // Skip tracking pixels
@@ -679,7 +927,11 @@ public class WebCrawler
         if (string.IsNullOrEmpty(path))
             path = "index";
 
-        if (!isImage)
+        if (!isImage && IsFileUrl(url))
+        {
+            // Files keep their original path and name
+        }
+        else if (!isImage)
         {
             // Encode query parameters into filename
             if (!string.IsNullOrEmpty(uri.Query))
@@ -755,17 +1007,17 @@ public class WebCrawler
     /// </summary>
     private string RewriteLinksToLocal(string html, string currentPageUrl)
     {
-        html = Regex.Replace(html, @"href=""([^""]+)""", match =>
+        html = Regex.Replace(html, @"(<a\b[^>]*?\shref="")([^""]+)""", match =>
         {
-            var href = match.Groups[1].Value;
+            var href = match.Groups[2].Value;
             try
             {
                 var resolved = ResolveUrl(href, currentPageUrl);
-                if (resolved != null && IsInScope(resolved))
+                if (resolved != null && IsInScope(resolved) && (_downloadFiles || !IsFileUrl(resolved)))
                 {
                     var targetRelPath = GetRelativeFilePath(resolved, isImage: false);
                     var localHref = GetRelativePathFromPage(currentPageUrl, targetRelPath);
-                    return $"href=\"{localHref}\"";
+                    return $"{match.Groups[1].Value}{localHref}\"";
                 }
             }
             catch
