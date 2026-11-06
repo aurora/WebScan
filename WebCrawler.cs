@@ -102,12 +102,43 @@ public class WebCrawler
             Console.WriteLine($"[INFO] Limit: {_limit.Value} pages");
     }
 
+    /// <summary>
+    /// Playwright only ships browser builds for specific distro releases. Newer Ubuntu releases
+    /// (e.g. in a Distrobox) are rejected, so fall back to the newest supported build.
+    /// </summary>
+    private static void ApplyLinuxPlatformOverride()
+    {
+        if (!OperatingSystem.IsLinux()
+            || !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("PLAYWRIGHT_HOST_PLATFORM_OVERRIDE")))
+            return;
+
+        try
+        {
+            var values = File.ReadAllLines("/etc/os-release")
+                .Select(l => l.Split('=', 2))
+                .Where(p => p.Length == 2)
+                .ToDictionary(p => p[0], p => p[1].Trim('"'));
+
+            if (values.GetValueOrDefault("ID") == "ubuntu"
+                && Version.TryParse(values.GetValueOrDefault("VERSION_ID"), out var version)
+                && version > new Version(24, 4))
+            {
+                Environment.SetEnvironmentVariable("PLAYWRIGHT_HOST_PLATFORM_OVERRIDE", "ubuntu24.04-x64");
+            }
+        }
+        catch (IOException)
+        {
+        }
+    }
+
     public async Task CrawlAsync()
     {
         var userAgent = UserAgents[_random.Next(UserAgents.Length)];
 
+        ApplyLinuxPlatformOverride();
+
         using var playwright = await Playwright.CreateAsync();
-        await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+        var launchOptions = new BrowserTypeLaunchOptions
         {
             Headless = true,
             Args =
@@ -116,7 +147,25 @@ public class WebCrawler
                 "--disable-features=IsolateOrigins,site-per-process",
                 "--no-sandbox"
             ]
-        });
+        };
+
+        IBrowser browser;
+        try
+        {
+            browser = await playwright.Chromium.LaunchAsync(launchOptions);
+        }
+        catch (PlaywrightException ex) when (ex.Message.Contains("Executable doesn't exist"))
+        {
+            // Browser not downloaded yet: install it via Playwright's built-in installer
+            // (works on Windows and Linux without PowerShell).
+            Console.WriteLine("[INFO] Chromium not found, installing (one-time download)...");
+            var exitCode = Microsoft.Playwright.Program.Main(["install", "chromium"]);
+            if (exitCode != 0)
+                throw new InvalidOperationException(
+                    $"Playwright browser installation failed (exit code {exitCode}).", ex);
+            browser = await playwright.Chromium.LaunchAsync(launchOptions);
+        }
+        await using var _ = browser;
 
         var context = await browser.NewContextAsync(new BrowserNewContextOptions
         {

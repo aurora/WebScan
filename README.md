@@ -35,10 +35,12 @@ cd webscan
 # Restore dependencies
 dotnet restore
 
-# Install Playwright browsers
 dotnet build
-pwsh bin/Debug/net10.0/playwright.ps1 install chromium
 ```
+
+Chromium is downloaded automatically on the first run (Windows and Linux, no PowerShell required).
+On Linux (e.g. Ubuntu/Distrobox) the browser may need system libraries, if launching fails:
+`sudo apt install libnss3 libatk-bridge2.0-0 libgbm1 libasound2t64 libxkbcommon0 libxdamage1 libxrandr2 libcups2 libpango-1.0-0`
 
 ## Usage
 
